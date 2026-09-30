@@ -1,17 +1,15 @@
 const express = require("express");
 const fs = require("fs");
+const fsp = fs.promises;
 const path = require("path");
 const crypto = require("crypto");
-const { execFile } = require("child_process");
+const { spawn, execFile } = require("child_process");
 
 const app = express();
 
-const PORT = Number(process.env.PORT || 8080);
+app.use(express.json({ limit: "10mb" }));
 
-const BASE_DIR = "/tmp/web2droid";
-const JOBS_DIR = path.join(BASE_DIR, "jobs");
-const BUILDS_DIR = path.join(BASE_DIR, "builds");
-const PROJECTS_DIR = path.join(BASE_DIR, "projects");
+const PORT = Number(process.env.PORT || 8080);
 
 const ANDROID_HOME =
   process.env.ANDROID_HOME ||
@@ -22,61 +20,111 @@ const GRADLE_BIN =
   process.env.GRADLE_BIN ||
   "/opt/gradle-8.7/bin/gradle";
 
+/*
+ * /app/data is used instead of /tmp so jobs survive
+ * normal application restarts.
+ */
+const DATA_DIR = "/app/data";
+const JOBS_DIR = path.join(DATA_DIR, "jobs");
+const BUILDS_DIR = path.join(DATA_DIR, "builds");
+const PROJECTS_DIR = path.join(DATA_DIR, "projects");
+
+const activeJobs = new Set();
+let workerRunning = false;
+
 const BUILD_TIMEOUT = 10 * 60 * 1000;
 
-fs.mkdirSync(JOBS_DIR, { recursive: true });
-fs.mkdirSync(BUILDS_DIR, { recursive: true });
-fs.mkdirSync(PROJECTS_DIR, { recursive: true });
-
-app.use(express.json({ limit: "10mb" }));
+async function ensureDirs() {
+  await fsp.mkdir(JOBS_DIR, { recursive: true });
+  await fsp.mkdir(BUILDS_DIR, { recursive: true });
+  await fsp.mkdir(PROJECTS_DIR, { recursive: true });
+}
 
 function now() {
   return new Date().toISOString();
 }
 
-function jobPath(id) {
+function jobFile(id) {
   return path.join(JOBS_DIR, `${id}.json`);
 }
 
-function loadJob(id) {
+async function saveJob(job) {
+  job.updatedAt = now();
+
+  const tmp = `${jobFile(job.id)}.tmp`;
+
+  await fsp.writeFile(
+    tmp,
+    JSON.stringify(job, null, 2),
+    "utf8"
+  );
+
+  await fsp.rename(tmp, jobFile(job.id));
+}
+
+async function loadJob(id) {
   try {
-    return JSON.parse(
-      fs.readFileSync(jobPath(id), "utf8")
-    );
+    const data = await fsp.readFile(jobFile(id), "utf8");
+    return JSON.parse(data);
   } catch {
     return null;
   }
 }
 
-function saveJob(job) {
-  fs.writeFileSync(
-    jobPath(job.id),
-    JSON.stringify(job, null, 2)
-  );
-}
+async function listJobs() {
+  try {
+    const files = await fsp.readdir(JOBS_DIR);
 
-function updateJob(job, changes) {
-  Object.assign(job, changes);
-  saveJob(job);
+    const result = [];
+
+    for (const file of files) {
+      if (!file.endsWith(".json")) continue;
+
+      try {
+        const data = await fsp.readFile(
+          path.join(JOBS_DIR, file),
+          "utf8"
+        );
+
+        result.push(JSON.parse(data));
+      } catch {}
+    }
+
+    return result;
+  } catch {
+    return [];
+  }
 }
 
 function addLog(job, message) {
-  job.logs = job.logs || [];
-  job.logs.push(`[${now()}] ${message}`);
-
-  if (job.logs.length > 100) {
-    job.logs = job.logs.slice(-100);
+  if (!Array.isArray(job.logs)) {
+    job.logs = [];
   }
 
-  saveJob(job);
+  job.logs.push(`[${now()}] ${message}`);
+
+  // Keep logs from growing forever.
+  if (job.logs.length > 500) {
+    job.logs = job.logs.slice(-500);
+  }
 }
 
-function makeJobId() {
-  return (
-    "job_" +
-    Date.now() +
-    "_" +
-    crypto.randomBytes(6).toString("hex")
+async function log(job, message) {
+  addLog(job, message);
+  await saveJob(job);
+}
+
+function createJobId() {
+  return `job_${Date.now()}_${crypto
+    .randomBytes(6)
+    .toString("hex")}`;
+}
+
+function validPackageName(value) {
+  if (typeof value !== "string") return false;
+
+  return /^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*)+$/.test(
+    value
   );
 }
 
@@ -91,19 +139,6 @@ function validUrl(value) {
   } catch {
     return false;
   }
-}
-
-function validPackageName(value) {
-  return /^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*)+$/.test(
-    value
-  );
-}
-
-function safeAppName(value) {
-  return String(value || "Web App")
-    .replace(/[<>:"/\\|?*\x00-\x1F]/g, "")
-    .trim()
-    .slice(0, 60) || "Web App";
 }
 
 function xmlEscape(value) {
@@ -125,133 +160,166 @@ function javaEscape(value) {
 
 function runCommand(command, args, options = {}) {
   return new Promise((resolve, reject) => {
+    const env = {
+      ...process.env,
+      ANDROID_HOME,
+      ANDROID_SDK_ROOT: ANDROID_HOME,
+      PATH:
+        `${ANDROID_HOME}/platform-tools:` +
+        `${ANDROID_HOME}/cmdline-tools/latest/bin:` +
+        `${process.env.PATH || ""}`
+    };
+
     execFile(
       command,
       args,
       {
         cwd: options.cwd,
-        env: {
-          ...process.env,
-
-          ANDROID_HOME,
-          ANDROID_SDK_ROOT: ANDROID_HOME,
-
-          PATH:
-            `${ANDROID_HOME}/platform-tools:` +
-            `${ANDROID_HOME}/cmdline-tools/latest/bin:` +
-            `/opt/gradle-8.7/bin:` +
-            (process.env.PATH || "")
-        },
-
+        env,
+        timeout: options.timeout || 120000,
         maxBuffer: 20 * 1024 * 1024
       },
-
       (error, stdout, stderr) => {
         if (error) {
-          const e = new Error(
-            `${command} ${args.join(" ")} failed\n` +
-            `${stderr || stdout || error.message}`
-          );
-
-          e.stdout = stdout;
-          e.stderr = stderr;
-
-          reject(e);
+          error.stdout = stdout;
+          error.stderr = stderr;
+          reject(error);
           return;
         }
 
         resolve({
-          stdout,
-          stderr
+          stdout: stdout || "",
+          stderr: stderr || ""
         });
       }
     );
   });
 }
 
-function writeFile(file, content) {
-  fs.mkdirSync(
-    path.dirname(file),
-    { recursive: true }
-  );
+function streamCommand(command, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    const env = {
+      ...process.env,
+      ANDROID_HOME,
+      ANDROID_SDK_ROOT: ANDROID_HOME,
+      PATH:
+        `${ANDROID_HOME}/platform-tools:` +
+        `${ANDROID_HOME}/cmdline-tools/latest/bin:` +
+        `${process.env.PATH || ""}`
+    };
 
-  fs.writeFileSync(
-    file,
-    content
-  );
+    const child = spawn(command, args, {
+      cwd: options.cwd,
+      env
+    });
+
+    let stdout = "";
+    let stderr = "";
+    let finished = false;
+
+    const timeout = setTimeout(() => {
+      if (finished) return;
+
+      try {
+        child.kill("SIGTERM");
+      } catch {}
+
+      setTimeout(() => {
+        try {
+          child.kill("SIGKILL");
+        } catch {}
+      }, 5000);
+
+      const error = new Error(
+        "Gradle build timed out after 10 minutes"
+      );
+
+      error.code = "BUILD_TIMEOUT";
+      error.stdout = stdout;
+      error.stderr = stderr;
+
+      finished = true;
+      reject(error);
+    }, options.timeout || BUILD_TIMEOUT);
+
+    child.stdout.on("data", chunk => {
+      const text = chunk.toString();
+
+      stdout += text;
+
+      if (options.onOutput) {
+        options.onOutput(text, false);
+      }
+    });
+
+    child.stderr.on("data", chunk => {
+      const text = chunk.toString();
+
+      stderr += text;
+
+      if (options.onOutput) {
+        options.onOutput(text, true);
+      }
+    });
+
+    child.on("error", error => {
+      if (finished) return;
+
+      finished = true;
+      clearTimeout(timeout);
+      reject(error);
+    });
+
+    child.on("close", code => {
+      if (finished) return;
+
+      finished = true;
+      clearTimeout(timeout);
+
+      if (code !== 0) {
+        const error = new Error(
+          `Command exited with code ${code}`
+        );
+
+        error.code = code;
+        error.stdout = stdout;
+        error.stderr = stderr;
+
+        reject(error);
+        return;
+      }
+
+      resolve({
+        code,
+        stdout,
+        stderr
+      });
+    });
+  });
 }
 
-async function buildJob(jobId) {
-  const job = loadJob(jobId);
+async function writeFile(file, content) {
+  await fsp.mkdir(path.dirname(file), {
+    recursive: true
+  });
 
-  if (!job) {
-    console.error(
-      "JOB NOT FOUND:",
-      jobId
-    );
-    return;
-  }
+  await fsp.writeFile(file, content, "utf8");
+}
 
-  if (job.status === "completed") {
-    return;
-  }
+async function createAndroidProject(job, projectDir) {
+  const packageName = job.packageName;
+  const appName = job.appName;
+  const url = job.url;
 
-  let projectDir = null;
+  const packagePath = packageName.replace(/\./g, "/");
 
-  try {
-    updateJob(job, {
-      status: "building",
-      progress: 5,
-      startedAt: now(),
-      error: null
-    });
+  await fsp.mkdir(projectDir, {
+    recursive: true
+  });
 
-    addLog(
-      job,
-      "Build worker started"
-    );
-
-    addLog(
-      job,
-      `ANDROID_HOME=${ANDROID_HOME}`
-    );
-
-    addLog(
-      job,
-      `GRADLE_BIN=${GRADLE_BIN}`
-    );
-
-    projectDir = path.join(
-      PROJECTS_DIR,
-      job.id
-    );
-
-    fs.rmSync(
-      projectDir,
-      {
-        recursive: true,
-        force: true
-      }
-    );
-
-    fs.mkdirSync(
-      projectDir,
-      {
-        recursive: true
-      }
-    );
-
-    addLog(
-      job,
-      "Creating Android project"
-    );
-
-    updateJob(job, {
-      progress: 10
-    });
-
-    const settingsGradle = `
-pluginManagement {
+  await writeFile(
+    path.join(projectDir, "settings.gradle"),
+`pluginManagement {
     repositories {
         google()
         mavenCentral()
@@ -267,57 +335,63 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "Web2DroidApp"
+rootProject.name = "Web2Droid"
 include(":app")
-`;
+`
+  );
 
-    const rootBuildGradle = `
-plugins {
+  await writeFile(
+    path.join(projectDir, "build.gradle"),
+`plugins {
     id 'com.android.application' version '8.5.2' apply false
 }
-`;
+`
+  );
 
-    const gradleProperties = `
-org.gradle.jvmargs=-Xmx1536m
+  await writeFile(
+    path.join(projectDir, "gradle.properties"),
+`org.gradle.jvmargs=-Xmx1536m -Dfile.encoding=UTF-8
 android.useAndroidX=true
 android.nonTransitiveRClass=true
-`;
+`
+  );
 
-    const appBuildGradle = `
-plugins {
+  const appDir = path.join(projectDir, "app");
+
+  await writeFile(
+    path.join(appDir, "build.gradle"),
+`plugins {
     id 'com.android.application'
 }
 
 android {
-    namespace '${job.packageName}'
+    namespace '${packageName}'
     compileSdk 35
 
     defaultConfig {
-        applicationId '${job.packageName}'
+        applicationId '${packageName}'
         minSdk 23
         targetSdk 35
         versionCode 1
-        versionName "1.0"
+        versionName '1.0'
     }
 }
 
 dependencies {
     implementation 'androidx.appcompat:appcompat:1.7.0'
 }
-`;
+`
+  );
 
-    const manifest = `
-<?xml version="1.0" encoding="utf-8"?>
-<manifest
-    xmlns:android="http://schemas.android.com/apk/res/android">
+  const manifest = `<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <uses-permission
-        android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.INTERNET" />
 
     <application
         android:allowBackup="true"
         android:usesCleartextTraffic="true"
-        android:label="${xmlEscape(job.appName)}"
+        android:label="${xmlEscape(appName)}"
         android:theme="@style/AppTheme">
 
         <activity
@@ -325,12 +399,8 @@ dependencies {
             android:exported="true">
 
             <intent-filter>
-                <action
-                    android:name="android.intent.action.MAIN" />
-
-                <category
-                    android:name="android.intent.category.LAUNCHER" />
-
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
 
         </activity>
@@ -340,26 +410,15 @@ dependencies {
 </manifest>
 `;
 
-    const styles = `
-<?xml version="1.0" encoding="utf-8"?>
-<resources>
+  await writeFile(
+    path.join(
+      appDir,
+      "src/main/AndroidManifest.xml"
+    ),
+    manifest
+  );
 
-    <style
-        name="AppTheme"
-        parent="android:style/Theme.Material.Light.NoActionBar">
-
-        <item name="android:fontFamily">sans</item>
-        <item name="android:colorAccent">#8B5CF6</item>
-        <item name="android:navigationBarColor">#000000</item>
-        <item name="android:statusBarColor">#000000</item>
-
-    </style>
-
-</resources>
-`;
-
-    const java = `
-package ${job.packageName};
+  const java = `package ${packageName};
 
 import android.app.Activity;
 import android.os.Bundle;
@@ -369,45 +428,39 @@ import android.webkit.WebViewClient;
 
 public class MainActivity extends Activity {
 
-    private WebView webView;
+    private static final String URL = "${javaEscape(url)}";
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
-        webView = new WebView(this);
+        WebView webView = new WebView(this);
 
-        webView.setWebViewClient(
-            new WebViewClient()
-        );
-
-        WebSettings settings =
-            webView.getSettings();
+        WebSettings settings = webView.getSettings();
 
         settings.setJavaScriptEnabled(true);
         settings.setDomStorageEnabled(true);
         settings.setDatabaseEnabled(true);
-
-        settings.setAllowFileAccess(true);
-        settings.setAllowContentAccess(true);
-
         settings.setLoadWithOverviewMode(true);
         settings.setUseWideViewPort(true);
+        settings.setBuiltInZoomControls(false);
+        settings.setDisplayZoomControls(false);
 
-        webView.loadUrl(
-            "${javaEscape(job.url)}"
-        );
+        webView.setWebViewClient(new WebViewClient());
 
         setContentView(webView);
+
+        webView.loadUrl(URL);
     }
 
     @Override
     public void onBackPressed() {
+        WebView webView =
+            (WebView) findViewById(android.R.id.content)
+            .getRootView()
+            .findFocus();
 
-        if (
-            webView != null &&
-            webView.canGoBack()
-        ) {
+        if (webView != null && webView.canGoBack()) {
             webView.goBack();
         } else {
             super.onBackPressed();
@@ -416,327 +469,263 @@ public class MainActivity extends Activity {
 }
 `;
 
-    writeFile(
-      path.join(
-        projectDir,
-        "settings.gradle"
-      ),
-      settingsGradle
-    );
+  await writeFile(
+    path.join(
+      appDir,
+      `src/main/java/${packagePath}/MainActivity.java`
+    ),
+    java
+  );
 
-    writeFile(
-      path.join(
-        projectDir,
-        "build.gradle"
-      ),
-      rootBuildGradle
-    );
+  const styles = `<?xml version="1.0" encoding="utf-8"?>
+<resources>
 
-    writeFile(
-      path.join(
-        projectDir,
-        "gradle.properties"
-      ),
-      gradleProperties
-    );
+    <style name="AppTheme"
+        parent="Theme.AppCompat.Light.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:windowActionModeOverlay">true</item>
+        <item name="android:colorAccent">#6200EE</item>
+    </style>
 
-    writeFile(
-      path.join(
-        projectDir,
-        "app",
-        "build.gradle"
-      ),
-      appBuildGradle
-    );
+</resources>
+`;
 
-    writeFile(
-      path.join(
-        projectDir,
-        "app",
-        "src",
-        "main",
-        "AndroidManifest.xml"
-      ),
-      manifest
-    );
+  await writeFile(
+    path.join(
+      appDir,
+      "src/main/res/values/styles.xml"
+    ),
+    styles
+  );
+}
 
-    writeFile(
-      path.join(
-        projectDir,
-        "app",
-        "src",
-        "main",
-        "res",
-        "values",
-        "styles.xml"
-      ),
-      styles
-    );
+async function appendGradleOutput(job, text, isError) {
+  const lines = String(text)
+    .split(/\r?\n/)
+    .map(x => x.trimEnd())
+    .filter(Boolean);
 
-    writeFile(
-      path.join(
-        projectDir,
-        "app",
-        "src",
-        "main",
-        "java",
-        ...job.packageName.split("."),
-        "MainActivity.java"
-      ),
-      java
-    );
+  if (!lines.length) return;
 
+  for (const line of lines.slice(-50)) {
     addLog(
       job,
-      "Android project created"
+      `${isError ? "[Gradle stderr] " : "[Gradle] "}${line}`
+    );
+  }
+
+  await saveJob(job);
+}
+
+async function buildJob(id) {
+  if (activeJobs.has(id)) {
+    return;
+  }
+
+  const job = await loadJob(id);
+
+  if (!job) {
+    return;
+  }
+
+  if (
+    job.status === "completed" ||
+    job.status === "failed"
+  ) {
+    return;
+  }
+
+  activeJobs.add(id);
+
+  try {
+    job.status = "building";
+    job.progress = Math.max(job.progress || 0, 5);
+
+    if (!job.startedAt) {
+      job.startedAt = now();
+    }
+
+    await log(job, "Build worker started");
+    await log(job, `ANDROID_HOME=${ANDROID_HOME}`);
+    await log(job, `GRADLE_BIN=${GRADLE_BIN}`);
+
+    const projectDir = path.join(
+      PROJECTS_DIR,
+      id
     );
 
-    updateJob(job, {
-      progress: 20
+    await log(job, "Creating Android project");
+
+    await fsp.rm(projectDir, {
+      recursive: true,
+      force: true
     });
 
-    addLog(
+    await createAndroidProject(
       job,
-      "Checking Java"
+      projectDir
     );
 
-    try {
-      const result = await runCommand(
-        "java",
-        ["-version"],
-        {
-          cwd: projectDir
-        }
-      );
+    job.progress = 20;
 
-      addLog(
-        job,
-        "Java is available"
-      );
+    await log(job, "Android project created");
+    await log(job, "Checking Java");
 
-      if (result.stderr) {
-        addLog(
-          job,
-          result.stderr
-            .trim()
-            .split("\n")[0]
-        );
+    const java = await runCommand(
+      "java",
+      ["-version"]
+    ).catch(error => {
+      throw new Error(
+        `Java check failed: ${error.message}\n${error.stderr || ""}`
+      );
+    });
+
+    await log(job, "Java is available");
+
+    const javaVersion =
+      java.stderr || java.stdout || "";
+
+    for (
+      const line of javaVersion
+        .split(/\r?\n/)
+        .filter(Boolean)
+        .slice(0, 5)
+    ) {
+      await log(job, line);
+    }
+
+    await log(job, "Checking Gradle");
+
+    await runCommand(
+      GRADLE_BIN,
+      ["--version"],
+      {
+        timeout: 120000
       }
-
-    } catch (e) {
-      throw new Error(
-        "Java is not available: " +
-        e.message
-      );
-    }
-
-    updateJob(job, {
-      progress: 30
-    });
-
-    addLog(
-      job,
-      "Checking Gradle"
     );
 
-    try {
+    await log(job, "Gradle is available");
 
-      await runCommand(
-        GRADLE_BIN,
-        ["--version"],
-        {
-          cwd: projectDir
-        }
-      );
+    job.progress = 40;
+    await saveJob(job);
 
-      addLog(
-        job,
-        "Gradle is available"
-      );
-
-    } catch (e) {
-
-      throw new Error(
-        "Gradle is not available: " +
-        e.message
-      );
-
-    }
-
-    updateJob(job, {
-      progress: 40
-    });
-
-    addLog(
+    await log(
       job,
       "Running Gradle assembleRelease"
     );
 
-    const buildPromise =
-      runCommand(
-        GRADLE_BIN,
-        [
-          "assembleRelease",
-          "--no-daemon",
-          "--stacktrace"
-        ],
-        {
-          cwd: projectDir
+    await streamCommand(
+      GRADLE_BIN,
+      [
+        "assembleRelease",
+        "--no-daemon",
+        "--stacktrace",
+        "--console=plain"
+      ],
+      {
+        cwd: projectDir,
+        timeout: BUILD_TIMEOUT,
+        onOutput: (text, isError) => {
+          appendGradleOutput(
+            job,
+            text,
+            isError
+          ).catch(() => {});
         }
-      );
-
-    const timeoutPromise =
-      new Promise(
-        (_, reject) => {
-
-          setTimeout(
-            () => {
-              reject(
-                new Error(
-                  "Build timeout after 10 minutes"
-                )
-              );
-            },
-            BUILD_TIMEOUT
-          );
-
-        }
-      );
-
-    const result =
-      await Promise.race([
-        buildPromise,
-        timeoutPromise
-      ]);
-
-    if (result.stdout) {
-
-      const lines =
-        result.stdout
-          .split("\n")
-          .filter(Boolean)
-          .slice(-30);
-
-      for (const line of lines) {
-        addLog(
-          job,
-          line
-        );
       }
-    }
-
-    updateJob(job, {
-      progress: 80
-    });
-
-    const apkPath =
-      path.join(
-        projectDir,
-        "app",
-        "build",
-        "outputs",
-        "apk",
-        "release",
-        "app-release.apk"
-      );
-
-    if (!fs.existsSync(apkPath)) {
-      throw new Error(
-        "APK was not generated: " +
-        apkPath
-      );
-    }
-
-    addLog(
-      job,
-      "APK generated successfully"
     );
 
-    const outputName =
-      `${job.packageName}-${job.id}.apk`;
+    job.progress = 85;
 
-    const outputPath =
+    await log(
+      job,
+      "Gradle assembleRelease completed"
+    );
+
+    const apkSource = path.join(
+      projectDir,
+      "app/build/outputs/apk/release/app-release.apk"
+    );
+
+    try {
+      await fsp.access(apkSource);
+    } catch {
+      throw new Error(
+        "Gradle completed but APK file was not found"
+      );
+    }
+
+    const apkName =
+      `${job.id}.apk`;
+
+    const apkDestination =
       path.join(
         BUILDS_DIR,
-        outputName
+        apkName
       );
 
-    fs.copyFileSync(
-      apkPath,
-      outputPath
+    await fsp.copyFile(
+      apkSource,
+      apkDestination
     );
 
-    const size =
-      fs.statSync(outputPath).size;
+    job.progress = 100;
+    job.status = "completed";
+    job.completedAt = now();
+    job.downloadUrl =
+      `/api/v1/download/${job.id}`;
 
-    addLog(
+    await log(job, "APK created successfully");
+    await log(
       job,
-      `APK size: ${size} bytes`
+      `APK path: ${apkDestination}`
     );
 
-    updateJob(job, {
-      status: "completed",
-      progress: 100,
-      completedAt: now(),
-      downloadUrl:
-        `/api/v1/download/${job.id}`,
-      apkPath: outputPath
-    });
-
-    addLog(
-      job,
-      "Build completed successfully"
-    );
+    await saveJob(job);
 
   } catch (error) {
-
     console.error(
-      "BUILD ERROR:",
-      jobId,
+      `Build failed for ${id}:`,
       error
     );
 
-    const currentJob =
-      loadJob(jobId);
+    job.status = "failed";
 
-    if (currentJob) {
+    job.error =
+      error.message ||
+      String(error);
 
-      updateJob(
-        currentJob,
-        {
-          status: "failed",
-          progress: 0,
-          completedAt: now(),
-          error: error.message
-        }
+    await log(
+      job,
+      `BUILD FAILED: ${job.error}`
+    );
+
+    if (error.stdout) {
+      await appendGradleOutput(
+        job,
+        error.stdout,
+        false
       );
-
-      addLog(
-        currentJob,
-        "BUILD FAILED"
-      );
-
-      if (error.stdout) {
-        addLog(
-          currentJob,
-          error.stdout.slice(-5000)
-        );
-      }
-
-      if (error.stderr) {
-        addLog(
-          currentJob,
-          error.stderr.slice(-5000)
-        );
-      }
     }
+
+    if (error.stderr) {
+      await appendGradleOutput(
+        job,
+        error.stderr,
+        true
+      );
+    }
+
+    job.completedAt = now();
+
+    await saveJob(job);
+
+  } finally {
+    activeJobs.delete(id);
   }
 }
 
-let workerRunning = false;
-
 async function processQueue() {
-
   if (workerRunning) {
     return;
   }
@@ -744,126 +733,86 @@ async function processQueue() {
   workerRunning = true;
 
   try {
+    const jobs = await listJobs();
 
-    const files =
-      fs.readdirSync(JOBS_DIR)
-        .filter(
-          file =>
-            file.endsWith(".json")
-        );
-
-    for (const file of files) {
-
-      const id =
-        path.basename(
-          file,
-          ".json"
-        );
-
-      const job =
-        loadJob(id);
-
-      if (!job) {
-        continue;
-      }
-
+    for (const job of jobs) {
       if (
-        job.status === "queued" ||
-        job.status === "building"
+        job.status === "queued" &&
+        !activeJobs.has(job.id)
       ) {
-
-        console.log(
-          "WORKER PICKED JOB:",
-          id
-        );
-
-        await buildJob(id);
-
-        break;
+        /*
+         * Do NOT await the build here.
+         * Start exactly one build and immediately
+         * continue checking the queue.
+         */
+        buildJob(job.id).catch(error => {
+          console.error(
+            "Queue build error:",
+            error
+          );
+        });
       }
     }
-
-  } catch (error) {
-
-    console.error(
-      "QUEUE ERROR:",
-      error
-    );
-
   } finally {
-
     workerRunning = false;
   }
 }
 
-app.get(
-  "/",
-  (req, res) => {
+app.get("/", (req, res) => {
+  res.json({
+    status: "ok",
+    service: "web2droid",
+    message: "Web2Droid APK Builder",
+    endpoints: {
+      health: "/health",
+      generate: "POST /api/v1/generate-apk",
+      job: "GET /api/v1/job/:id",
+      download: "GET /api/v1/download/:id"
+    }
+  });
+});
 
-    res.json({
-      name:
-        "Hazard Studio Web2Droid",
+app.get("/health", async (req, res) => {
+  let java = false;
+  let gradle = false;
 
-      version:
-        "2.0.0",
+  try {
+    await runCommand(
+      "java",
+      ["-version"],
+      { timeout: 10000 }
+    );
 
-      status:
-        "online",
+    java = true;
+  } catch {}
 
-      service:
-        "Web URL to APK",
+  try {
+    await runCommand(
+      GRADLE_BIN,
+      ["--version"],
+      { timeout: 10000 }
+    );
 
-      endpoints: {
-        health:
-          "GET /health",
+    gradle = true;
+  } catch {}
 
-        generate:
-          "POST /api/v1/generate-apk",
-
-        job:
-          "GET /api/v1/job/:id",
-
-        download:
-          "GET /api/v1/download/:id"
-      }
-    });
-
-  }
-);
-
-app.get(
-  "/health",
-  (req, res) => {
-
-    res.json({
-      status:
-        "ok",
-
-      service:
-        "web2droid",
-
-      worker:
-        workerRunning,
-
-      androidHome:
-        ANDROID_HOME,
-
-      gradle:
-        GRADLE_BIN,
-
-      time:
-        now()
-    });
-
-  }
-);
+  res.json({
+    status: "ok",
+    service: "web2droid",
+    worker: workerRunning,
+    activeBuilds: activeJobs.size,
+    java,
+    gradleAvailable: gradle,
+    androidHome: ANDROID_HOME,
+    gradle: GRADLE_BIN,
+    time: now()
+  });
+});
 
 app.post(
   "/api/v1/generate-apk",
-  (req, res) => {
-
+  async (req, res) => {
     try {
-
       const {
         url,
         packageName,
@@ -871,341 +820,236 @@ app.post(
       } = req.body || {};
 
       if (!url) {
-
         return res.status(400).json({
           success: false,
-          error:
-            "url is required"
+          error: "url is required"
         });
-
       }
 
       if (!validUrl(url)) {
-
         return res.status(400).json({
           success: false,
-          error:
-            "URL must start with http:// or https://"
+          error: "Invalid URL"
         });
-
       }
 
       if (!packageName) {
-
         return res.status(400).json({
           success: false,
-          error:
-            "packageName is required"
+          error: "packageName is required"
         });
-
       }
 
       if (!validPackageName(packageName)) {
-
         return res.status(400).json({
           success: false,
           error:
-            "Invalid Android package name"
+            "Invalid packageName. Example: com.example.myapp"
         });
-
       }
 
       const appName =
-        safeAppName(
+        String(
           options.appName ||
-          options.name ||
-          "Web App"
-        );
+          "Web2Droid App"
+        ).slice(0, 80);
 
-      const id =
-        makeJobId();
+      const id = createJobId();
 
       const job = {
-
         id,
-
         url,
-
         packageName,
-
         appName,
-
-        status:
-          "queued",
-
-        progress:
-          0,
-
-        createdAt:
-          now(),
-
-        startedAt:
-          null,
-
-        completedAt:
-          null,
-
-        downloadUrl:
-          null,
-
-        apkPath:
-          null,
-
-        error:
-          null,
-
-        logs: [
-          "Job created"
-        ]
+        status: "queued",
+        progress: 0,
+        createdAt: now(),
+        startedAt: null,
+        completedAt: null,
+        downloadUrl: null,
+        error: null,
+        logs: ["Job created"]
       };
 
-      saveJob(job);
+      await saveJob(job);
 
-      console.log(
-        "NEW JOB:",
-        id
-      );
-
-      Promise.resolve()
-        .then(
-          () => buildJob(id)
-        )
-        .catch(
-          error => {
-            console.error(
-              "Detached worker error:",
-              error
-            );
-          }
+      /*
+       * IMPORTANT:
+       * There is only one execution path.
+       * We don't also call setImmediate().
+       */
+      buildJob(id).catch(error => {
+        console.error(
+          "Direct build error:",
+          error
         );
-
-      return res
-        .status(202)
-        .json({
-
-          success:
-            true,
-
-          jobId:
-            id,
-
-          status:
-            "queued",
-
-          statusUrl:
-            `/api/v1/job/${id}`,
-
-          message:
-            "APK build started"
-        });
-
-    } catch (error) {
-
-      console.error(
-        "GENERATE ERROR:",
-        error
-      );
-
-      return res.status(500).json({
-        success:
-          false,
-
-        error:
-          error.message
       });
 
-    }
+      res.status(202).json({
+        success: true,
+        jobId: id,
+        status: "queued",
+        statusUrl:
+          `/api/v1/job/${id}`,
+        message:
+          "APK build started"
+      });
 
+    } catch (error) {
+      console.error(error);
+
+      res.status(500).json({
+        success: false,
+        error: error.message
+      });
+    }
   }
 );
 
 app.get(
   "/api/v1/job/:id",
-  (req, res) => {
-
+  async (req, res) => {
     const job =
-      loadJob(
-        req.params.id
-      );
+      await loadJob(req.params.id);
 
     if (!job) {
-
       return res.status(404).json({
-        success:
-          false,
-
-        error:
-          "Job not found"
+        success: false,
+        error: "Job not found"
       });
-
     }
 
-    res.json({
-
-      id:
-        job.id,
-
-      url:
-        job.url,
-
-      packageName:
-        job.packageName,
-
-      appName:
-        job.appName,
-
-      status:
-        job.status,
-
-      progress:
-        job.progress,
-
-      createdAt:
-        job.createdAt,
-
-      startedAt:
-        job.startedAt,
-
-      completedAt:
-        job.completedAt,
-
-      downloadUrl:
-        job.downloadUrl,
-
-      error:
-        job.error,
-
-      logs:
-        job.logs || []
-    });
-
+    res.json(job);
   }
 );
 
 app.get(
   "/api/v1/download/:id",
-  (req, res) => {
-
+  async (req, res) => {
     const job =
-      loadJob(
-        req.params.id
-      );
+      await loadJob(req.params.id);
 
     if (!job) {
-
       return res.status(404).json({
-        success:
-          false,
-
-        error:
-          "Job not found"
+        success: false,
+        error: "Job not found"
       });
-
     }
 
-    if (
-      job.status !==
-      "completed"
-    ) {
-
+    if (job.status !== "completed") {
       return res.status(409).json({
-
-        success:
-          false,
-
+        success: false,
         error:
           "APK is not ready",
-
-        status:
-          job.status,
-
-        progress:
-          job.progress
+        status: job.status
       });
-
     }
 
-    if (
-      !job.apkPath ||
-      !fs.existsSync(
-        job.apkPath
-      )
-    ) {
+    const apk =
+      path.join(
+        BUILDS_DIR,
+        `${job.id}.apk`
+      );
 
+    try {
+      await fsp.access(apk);
+    } catch {
       return res.status(404).json({
-        success:
-          false,
-
-        error:
-          "APK file not found"
+        success: false,
+        error: "APK file not found"
       });
-
     }
 
     res.download(
-      job.apkPath,
-      `${job.appName}.apk`
+      apk,
+      `${job.appName || "Web2Droid"}.apk`
     );
-
   }
 );
 
-app.use(
-  (err, req, res, next) => {
+async function recoverJobs() {
+  const jobs = await listJobs();
 
-    console.error(
-      "EXPRESS ERROR:",
-      err
-    );
+  for (const job of jobs) {
+    /*
+     * A process restart can leave a job marked
+     * "building". Put it back into the queue.
+     */
+    if (job.status === "building") {
+      job.status = "queued";
+      job.progress = 0;
+      job.error = null;
 
-    res.status(500).json({
-      success:
-        false,
+      addLog(
+        job,
+        "Previous build process ended; job requeued"
+      );
 
-      error:
-        "Internal server error"
+      await saveJob(job);
+    }
+  }
+}
+
+async function start() {
+  await ensureDirs();
+
+  await recoverJobs();
+
+  setInterval(() => {
+    processQueue().catch(error => {
+      console.error(
+        "Queue worker error:",
+        error
+      );
     });
+  }, 3000);
 
+  await processQueue();
+
+  app.listen(PORT, () => {
+    console.log(
+      `🚀 Web2Droid running on port ${PORT}`
+    );
+
+    console.log(
+      `📱 ANDROID_HOME=${ANDROID_HOME}`
+    );
+
+    console.log(
+      `⚙️ GRADLE_BIN=${GRADLE_BIN}`
+    );
+
+    console.log(
+      "🔥 Build worker ready"
+    );
+  });
+}
+
+start().catch(error => {
+  console.error(
+    "Fatal startup error:",
+    error
+  );
+
+  process.exit(1);
+});
+
+process.on(
+  "unhandledRejection",
+  error => {
+    console.error(
+      "Unhandled rejection:",
+      error
+    );
   }
 );
 
-app.listen(
-  PORT,
-  "0.0.0.0",
-  () => {
-
-    console.log(
-      "================================"
-    );
-
-    console.log(
-      "🚀 Hazard Studio Web2Droid"
-    );
-
-    console.log(
-      `🌐 Port: ${PORT}`
-    );
-
-    console.log(
-      `🤖 Android SDK: ${ANDROID_HOME}`
-    );
-
-    console.log(
-      `⚙️ Gradle: ${GRADLE_BIN}`
-    );
-
-    console.log(
-      "================================"
-    );
-
-    setInterval(
-      processQueue,
-      3000
-    );
-
-    setTimeout(
-      processQueue,
-      1000
+process.on(
+  "uncaughtException",
+  error => {
+    console.error(
+      "Uncaught exception:",
+      error
     );
   }
 );
